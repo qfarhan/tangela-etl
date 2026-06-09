@@ -1,0 +1,15 @@
+# Development & test dependencies (includes the runtime deps via -r below).
+#
+# Mirrors the [project.optional-dependencies] "dev" group in pyproject.toml.
+# Install with:   pip install -r requirements-dev.txt
+#
+# pyproject.toml remains the source of truth; the preferred install is:
+#   pip install -e ".[dev]"
+
+-r requirements.txt
+
+pytest>=7.4
+pytest-mock>=3.12
+pytest-cov>=4.1
+ruff>=0.4
+mypy>=1.8

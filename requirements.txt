@@ -1,0 +1,11 @@
+# Runtime dependencies.
+#
+# NOTE: pyproject.toml is the source of truth for this project. This file is a
+# convenience mirror for tools/pipelines that expect a requirements.txt. The
+# preferred install is:   pip install -e .
+#
+# To install just the runtime deps with this file:   pip install -r requirements.txt
+
+confluent-kafka>=2.3
+elasticsearch>=8.0,<9
+python-dotenv>=1.0

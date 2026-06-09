@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import sys; sys.path.insert\\(0,'src'\\); import etl; print\\('etl', etl.__version__\\)\")",
+      "Bash(.venv/bin/python -)"
+    ]
+  }
+}
