@@ -4,7 +4,7 @@ A long-lived Python service that replaces an Apache NiFi flow:
 
 1. Consumes a Kafka **control topic**.
 2. For each message, loads a job description from an **Elasticsearch** doc.
-3. Paginates the target ES data index (Scroll or `search_after` + PIT).
+3. Paginates the target ES data index (point-in-time + `search_after`).
 4. Projects each hit to a flat row via a dotted-path **column map**.
 5. Streams a **CSV** + **SHA256 sidecar** to local staging.
 6. Validates ES `_count` against the CSV row count (5 `_count` retries + 1 full re-extract).
@@ -46,7 +46,7 @@ RETRY_BACKOFF_CAP=30.0
 RETRY_JITTER=0.25
 ```
 
-Pagination: `PAGINATION_STRATEGY=scroll` (default, NiFi parity) or `search_after`.
+Pagination: point-in-time + `search_after` (Elastic's recommended deep-pagination mechanism). Tune with `PAGE_SIZE` and `PIT_KEEP_ALIVE`.
 
 ## Job document shape
 
@@ -87,7 +87,7 @@ The referenced ES document in `ES_JOB_INDEX` looks like:
 ## Tests
 
 ```bash
-.venv/bin/pytest -q                        # 67 tests, no network needed
+.venv/bin/pytest -q                        # 72 tests, no network needed
 .venv/bin/pytest --cov=etl --cov-report=term-missing
 ```
 
@@ -158,7 +158,7 @@ Failure-mode smoke tests against the mock stack:
 
 ```
 src/es_extract/          standalone ES extraction (deps: elasticsearch + stdlib only)
-  pagination.py          Scroll + PIT/search_after strategies, factory
+  pagination.py          PIT + search_after streaming generator
   extract.py             count() + one-call iter_hits()
   diagnostics.py         tee_to_ndjson / dump_to_ndjson
   errors.py              EsExtractError (injectable error_cls)
@@ -167,10 +167,7 @@ src/etl/
   config.py              env-var → Settings dataclass
   control_consumer.py    confluent_kafka.Consumer wrapper, manual commits
   job_loader.py          GET <job_doc_id> → JobSpec
-  pagination/
-    scroll.py            Scroll API (NiFi parity, default) — wraps es_extract
-    search_after.py      PIT + search_after (recommended for new jobs) — wraps es_extract
-  extractor.py           _count + delegates to pagination strategy
+  extractor.py           _count + PIT/search_after hits (wraps es_extract)
   transformer.py         dotted-path projection (no JOLT)
   csv_writer.py          streaming CSV + sha256 sidecar
   validator.py           5× _count retries → 1 full re-extract
@@ -192,12 +189,17 @@ from es_extract import count, iter_hits
 es = Elasticsearch("http://localhost:9200")
 q = {"match_all": {}}
 print(count(es, "my-index", q))
-for src in iter_hits(es, "my-index", q, strategy="search_after"):
+for src in iter_hits(es, "my-index", q):       # PIT + search_after under the hood
     ...                       # each hit's _source; pass source_only=False for the full envelope
 ```
 
-`etl`'s `pagination/` and `extractor.py` are thin wrappers over this package that pin
-failures to `ElasticsearchQueryError`.
+`etl`'s `extractor.py` is a thin wrapper over this package that pins failures to
+`ElasticsearchQueryError`. To exercise `es_extract` on its own against a real ES —
+optionally seeding a throwaway index first — run:
+
+```bash
+python scripts/try_es_extract.py --seed --cleanup
+```
 
 ## Diagnostics: dump the raw hits
 

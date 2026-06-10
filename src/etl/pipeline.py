@@ -17,7 +17,6 @@ from etl.csv_writer import write_csv
 from etl.extractor import expected_count, iter_hits
 from etl.job_loader import load_job
 from etl.models import ControlMessage, CsvResult, JobSpec
-from etl.pagination.base import PaginationStrategy, make_strategy
 from etl.sftp_uploader import UploadPlan, upload
 from etl.transformer import iter_transformed
 from etl.validator import validate_with_retry
@@ -38,12 +37,12 @@ def _do_extract_to_csv(
     *,
     es: Any,
     job: JobSpec,
-    strategy: PaginationStrategy,
     page_size: int,
+    keep_alive: str,
     local_csv: Path,
     raw_dump_path: Path | None = None,
 ) -> CsvResult:
-    hits = iter_hits(es, job, strategy, page_size=page_size)
+    hits = iter_hits(es, job, page_size=page_size, keep_alive=keep_alive)
     if raw_dump_path is not None:
         # Diagnostic: tee the raw extracted hits to NDJSON as they stream.
         hits = tee_to_ndjson(hits, raw_dump_path)
@@ -71,11 +70,6 @@ def run_one(
     initial_count = expected_count(es, job.data_index, job.query)
     _log.info("expected_count=%d", initial_count, extra=log_extra)
 
-    strategy = make_strategy(settings.pagination.strategy,
-                             keep_alive=settings.pagination.scroll_keep_alive
-                             if settings.pagination.strategy == "scroll"
-                             else settings.pagination.pit_keep_alive)
-
     local_csv, remote_csv, remote_sidecar = _staged_paths(settings.csv_output_dir, job)
 
     raw_dump_path = (
@@ -89,8 +83,8 @@ def run_one(
     csv_result = _do_extract_to_csv(
         es=es,
         job=job,
-        strategy=strategy,
         page_size=settings.pagination.page_size,
+        keep_alive=settings.pagination.pit_keep_alive,
         local_csv=local_csv,
         raw_dump_path=raw_dump_path,
     )
@@ -99,14 +93,12 @@ def run_one(
 
     def _reextract() -> CsvResult:
         _log.warning("re-extracting after count mismatch", extra=log_extra)
-        # Re-build the strategy because the previous one's resources are spent.
-        s2 = make_strategy(settings.pagination.strategy,
-                           keep_alive=settings.pagination.scroll_keep_alive
-                           if settings.pagination.strategy == "scroll"
-                           else settings.pagination.pit_keep_alive)
+        # A fresh call opens a new point-in-time; the previous one is spent.
         return _do_extract_to_csv(
-            es=es, job=job, strategy=s2,
-            page_size=settings.pagination.page_size, local_csv=local_csv,
+            es=es, job=job,
+            page_size=settings.pagination.page_size,
+            keep_alive=settings.pagination.pit_keep_alive,
+            local_csv=local_csv,
             raw_dump_path=raw_dump_path,
         )
 

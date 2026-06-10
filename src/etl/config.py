@@ -81,9 +81,7 @@ class EsConfig:
 
 @dataclass(frozen=True)
 class PaginationConfig:
-    strategy: str
     page_size: int
-    scroll_keep_alive: str
     pit_keep_alive: str
 
 
@@ -143,15 +141,9 @@ def load_settings(*, dotenv_path: str | None = None) -> Settings:
     )
 
     pagination = PaginationConfig(
-        strategy=_get("PAGINATION_STRATEGY", "scroll").lower(),
         page_size=_get_int("PAGE_SIZE", 1000),
-        scroll_keep_alive=_get("SCROLL_KEEP_ALIVE", "5m"),
         pit_keep_alive=_get("PIT_KEEP_ALIVE", "5m"),
     )
-    if pagination.strategy not in ("scroll", "search_after"):
-        raise ConfigError(
-            f"PAGINATION_STRATEGY must be 'scroll' or 'search_after', got {pagination.strategy!r}"
-        )
 
     retry = RetryConfig(
         max_attempts=_get_int("RETRY_MAX_ATTEMPTS", 5),

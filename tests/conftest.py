@@ -85,9 +85,7 @@ def settings(tmp_path: Path, tmp_csv_dir: Path, retry_cfg_fast: RetryConfig) -> 
             job_index="jobs",
         ),
         pagination=PaginationConfig(
-            strategy="scroll",
             page_size=2,
-            scroll_keep_alive="1m",
             pit_keep_alive="1m",
         ),
         retry=retry_cfg_fast,

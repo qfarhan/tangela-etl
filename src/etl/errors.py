@@ -26,7 +26,7 @@ class JobSpecError(EtlError):
 
 
 class ElasticsearchQueryError(EtlError):
-    """Raised on ES request failures (count, search, scroll, PIT)."""
+    """Raised on ES request failures (count, search, PIT)."""
 
 
 class TransformError(EtlError):

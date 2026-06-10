@@ -31,8 +31,8 @@ def test_load_settings_with_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     s = load_settings()
     assert s.kafka.bootstrap_servers == "localhost:9092"
     assert s.es.hosts == ["http://localhost:9200", "http://other:9200"]
-    assert s.pagination.strategy == "scroll"
     assert s.pagination.page_size == 1000
+    assert s.pagination.pit_keep_alive == "5m"
     assert s.retry.max_attempts == 5
     assert s.retry.backoff_base == 1.0
     assert s.sftp.port == 22
@@ -43,13 +43,6 @@ def test_load_settings_missing_required_raises(monkeypatch: pytest.MonkeyPatch) 
     env.pop("KAFKA_BOOTSTRAP_SERVERS")
     _set_env(monkeypatch, env)
     with pytest.raises(ConfigError, match="KAFKA_BOOTSTRAP_SERVERS"):
-        load_settings()
-
-
-def test_load_settings_bad_pagination_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
-    env = dict(_BASE_ENV, PAGINATION_STRATEGY="random_walk")
-    _set_env(monkeypatch, env)
-    with pytest.raises(ConfigError, match="PAGINATION_STRATEGY"):
         load_settings()
 
 

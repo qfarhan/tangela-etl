@@ -1,14 +1,17 @@
-"""Pluggable Elasticsearch pagination — Scroll and PIT + ``search_after``.
+"""Point-in-time + ``search_after`` Elasticsearch pagination.
 
-Both strategies are generators that own their server-side resource (scroll
-context / PIT) and release it in a ``finally`` block, even if the consumer
-abandons iteration early. They are duck-typed against the official
-``elasticsearch`` client but take any object exposing the handful of methods
-they call, so they are trivially testable with a fake.
+A single streaming strategy: :class:`SearchAfterPagination` opens a
+point-in-time (PIT), pages through every matching hit with ``search_after``,
+and **always** closes the PIT in a ``finally`` block — even if the consumer
+abandons iteration early. It is a generator, so it stays memory-bounded (one
+page at a time) regardless of how large the result set is.
 
-Three knobs distinguish this from an application-specific extractor:
+It is duck-typed against the official ``elasticsearch`` client but accepts any
+object exposing ``open_point_in_time`` / ``search`` / ``close_point_in_time``,
+so it is trivially testable with a fake.
 
-* ``keep_alive`` — the scroll TTL / PIT keep-alive.
+Two knobs distinguish it from an application-specific extractor:
+
 * ``source_only`` — when ``True`` (default) yield each hit's ``_source``; when
   ``False`` yield the full hit envelope (``_id``, ``_score``, ``sort``, …).
 * ``error_cls`` — the exception type a request failure is wrapped in, so a host
@@ -20,17 +23,11 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 from es_extract.errors import EsExtractError
 
 _log = logging.getLogger(__name__)
-
-
-class PaginationStrategy(Protocol):
-    def iter_hits(
-        self, *, es: Any, index: str, query: dict[str, Any], page_size: int
-    ) -> Iterator[dict[str, Any]]: ...
 
 
 def _emit(hit: dict[str, Any], *, source_only: bool) -> dict[str, Any]:
@@ -42,49 +39,13 @@ def _emit(hit: dict[str, Any], *, source_only: bool) -> dict[str, Any]:
 
 
 @dataclass
-class ScrollPagination:
-    """Elasticsearch Scroll API pagination."""
-
-    keep_alive: str = "5m"
-    source_only: bool = True
-    error_cls: type[Exception] = EsExtractError
-
-    def iter_hits(
-        self, *, es: Any, index: str, query: dict[str, Any], page_size: int
-    ) -> Iterator[dict[str, Any]]:
-        scroll_id: str | None = None
-        try:
-            try:
-                resp = es.search(
-                    index=index, scroll=self.keep_alive, size=page_size,
-                    body={"query": query},
-                )
-            except Exception as e:
-                raise self.error_cls(f"initial scroll search failed: {e!r}") from e
-            scroll_id = resp.get("_scroll_id")
-            hits = resp.get("hits", {}).get("hits", [])
-            while hits:
-                for h in hits:
-                    yield _emit(h, source_only=self.source_only)
-                if scroll_id is None:
-                    break
-                try:
-                    resp = es.scroll(scroll_id=scroll_id, scroll=self.keep_alive)
-                except Exception as e:
-                    raise self.error_cls(f"scroll continuation failed: {e!r}") from e
-                scroll_id = resp.get("_scroll_id")
-                hits = resp.get("hits", {}).get("hits", [])
-        finally:
-            if scroll_id is not None:
-                try:
-                    es.clear_scroll(scroll_id=scroll_id)
-                except Exception as e:  # best-effort: the scroll TTL reaps it anyway
-                    _log.warning("clear_scroll failed: %r", e)
-
-
-@dataclass
 class SearchAfterPagination:
-    """Point-in-time + ``search_after`` pagination (modern Scroll replacement)."""
+    """Point-in-time + ``search_after`` pagination (Elastic's recommended
+    deep-pagination mechanism).
+
+    Each call to :meth:`iter_hits` owns one PIT for the lifetime of the
+    generator and releases it on completion *or* early abandonment.
+    """
 
     keep_alive: str = "5m"
     source_only: bool = True
@@ -128,22 +89,5 @@ class SearchAfterPagination:
             if pit_id is not None:
                 try:
                     es.close_point_in_time(body={"id": pit_id})
-                except Exception as e:
+                except Exception as e:  # best-effort: the PIT keep-alive reaps it anyway
                     _log.warning("close_point_in_time failed: %r", e)
-
-
-def make_strategy(
-    name: str, *, keep_alive: str = "5m", source_only: bool = True,
-    error_cls: type[Exception] = EsExtractError,
-) -> PaginationStrategy:
-    """Build a strategy by short name (``"scroll"`` | ``"search_after"``)."""
-    n = name.lower()
-    if n == "scroll":
-        return ScrollPagination(
-            keep_alive=keep_alive, source_only=source_only, error_cls=error_cls
-        )
-    if n == "search_after":
-        return SearchAfterPagination(
-            keep_alive=keep_alive, source_only=source_only, error_cls=error_cls
-        )
-    raise error_cls(f"unknown pagination strategy: {name!r}")

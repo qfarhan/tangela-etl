@@ -34,11 +34,22 @@ def _es_with_job_and_hits(hits: list[dict[str, Any]]) -> MagicMock:
         },
     }
     es.count.return_value = {"count": len(hits)}
-    es.search.return_value = {
-        "_scroll_id": "scroll-1",
-        "hits": {"hits": [{"_source": h} for h in hits]},
+    es.open_point_in_time.return_value = {"id": "pit-1"}
+
+    # PIT + search_after paging. Every extraction opens a fresh PIT and starts
+    # with no `search_after`: return the full page first, then an empty page so
+    # iteration terminates. Keyed on the body so repeated extractions (the
+    # re-extract path) work too.
+    page = {
+        "pit_id": "pit-1",
+        "hits": {"hits": [{"_source": h, "sort": [i]} for i, h in enumerate(hits)]},
     }
-    es.scroll.return_value = {"_scroll_id": "scroll-2", "hits": {"hits": []}}
+    empty: dict[str, Any] = {"pit_id": "pit-1", "hits": {"hits": []}}
+
+    def _search(**kwargs: Any) -> dict[str, Any]:
+        return empty if "search_after" in kwargs["body"] else page
+
+    es.search.side_effect = _search
     return es
 
 

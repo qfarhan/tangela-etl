@@ -11,12 +11,10 @@ import pytest
 
 from es_extract import (
     EsExtractError,
-    ScrollPagination,
     SearchAfterPagination,
     count,
     dump_to_ndjson,
     iter_hits,
-    make_strategy,
     tee_to_ndjson,
 )
 
@@ -54,57 +52,29 @@ def test_count_wraps_errors_with_injected_error_cls() -> None:
         count(es, "i", {}, error_cls=MyErr)
 
 
-# --- scroll --------------------------------------------------------------
-
-def test_scroll_streams_source_and_clears() -> None:
-    es = MagicMock()
-    es.search.return_value = {"_scroll_id": "s1", "hits": {"hits": [_hit({"id": 1})]}}
-    es.scroll.return_value = {"_scroll_id": "s2", "hits": {"hits": []}}
-    out = list(ScrollPagination().iter_hits(es=es, index="i", query={}, page_size=10))
-    assert out == [{"id": 1}]
-    es.clear_scroll.assert_called_once_with(scroll_id="s2")
-
-
-def test_scroll_source_only_false_yields_full_envelope() -> None:
-    es = MagicMock()
-    es.search.return_value = {"_scroll_id": "s1", "hits": {"hits": [_hit({"id": 1})]}}
-    es.scroll.return_value = {"_scroll_id": "s1", "hits": {"hits": []}}
-    out = list(
-        ScrollPagination(source_only=False).iter_hits(
-            es=es, index="i", query={}, page_size=10
-        )
-    )
-    assert out == [{"_source": {"id": 1}, "_id": 1}]  # envelope retained, incl. _id
-
-
-def test_scroll_clears_on_early_close() -> None:
-    es = MagicMock()
-    es.search.return_value = {
-        "_scroll_id": "s", "hits": {"hits": [_hit({"id": 1}), _hit({"id": 2})]},
-    }
-    gen = ScrollPagination().iter_hits(es=es, index="i", query={}, page_size=2)
-    next(gen)
-    gen.close()
-    es.clear_scroll.assert_called_once_with(scroll_id="s")
-
-
-def test_scroll_wraps_errors_with_injected_cls() -> None:
-    class MyErr(Exception):
-        pass
-
-    es = MagicMock()
-    es.search.side_effect = RuntimeError("down")
-    with pytest.raises(MyErr):
-        list(
-            ScrollPagination(error_cls=MyErr).iter_hits(
-                es=es, index="i", query={}, page_size=2
-            )
-        )
-
-
-# --- search_after --------------------------------------------------------
+# --- search_after pagination ---------------------------------------------
 
 def test_search_after_pages_and_closes_pit() -> None:
+    es = MagicMock()
+    es.open_point_in_time.return_value = {"id": "pit-1"}
+    es.search.side_effect = [
+        {"pit_id": "pit-1",
+         "hits": {"hits": [_hit({"id": 1}, [1]), _hit({"id": 2}, [2])]}},
+        {"pit_id": "pit-1", "hits": {"hits": [_hit({"id": 3}, [3])]}},
+        {"pit_id": "pit-1", "hits": {"hits": []}},
+    ]
+    out = list(SearchAfterPagination().iter_hits(es=es, index="i", query={}, page_size=2))
+    assert out == [{"id": 1}, {"id": 2}, {"id": 3}]
+    # search_after threads the previous page's last sort value through.
+    bodies = [c.kwargs["body"] for c in es.search.call_args_list]
+    assert "search_after" not in bodies[0]
+    assert bodies[1]["search_after"] == [2]
+    assert bodies[2]["search_after"] == [3]
+    es.open_point_in_time.assert_called_once_with(index="i", keep_alive="5m")
+    es.close_point_in_time.assert_called_once_with(body={"id": "pit-1"})
+
+
+def test_search_after_source_only_false_yields_full_envelope() -> None:
     es = MagicMock()
     es.open_point_in_time.return_value = {"id": "pit-1"}
     es.search.side_effect = [
@@ -112,9 +82,23 @@ def test_search_after_pages_and_closes_pit() -> None:
         {"pit_id": "pit-1", "hits": {"hits": []}},
     ]
     out = list(
-        SearchAfterPagination().iter_hits(es=es, index="i", query={}, page_size=1)
+        SearchAfterPagination(source_only=False).iter_hits(
+            es=es, index="i", query={}, page_size=1
+        )
     )
-    assert out == [{"id": 1}]
+    assert out == [{"_source": {"id": 1}, "_id": 1, "sort": [1]}]  # envelope incl. _id
+
+
+def test_search_after_closes_pit_on_early_close() -> None:
+    es = MagicMock()
+    es.open_point_in_time.return_value = {"id": "pit-1"}
+    es.search.return_value = {
+        "pit_id": "pit-1",
+        "hits": {"hits": [_hit({"id": 1}, [1]), _hit({"id": 2}, [2])]},
+    }
+    gen = SearchAfterPagination().iter_hits(es=es, index="i", query={}, page_size=2)
+    next(gen)
+    gen.close()
     es.close_point_in_time.assert_called_once_with(body={"id": "pit-1"})
 
 
@@ -126,27 +110,34 @@ def test_search_after_open_error_does_not_close() -> None:
     es.close_point_in_time.assert_not_called()
 
 
-# --- factory + one-call iter_hits ---------------------------------------
-
-def test_make_strategy_dispatches() -> None:
-    assert isinstance(make_strategy("scroll"), ScrollPagination)
-    assert isinstance(make_strategy("search_after"), SearchAfterPagination)
-
-
-def test_make_strategy_unknown_raises_error_cls() -> None:
+def test_search_after_wraps_errors_with_injected_cls() -> None:
     class MyErr(Exception):
         pass
 
-    with pytest.raises(MyErr):
-        make_strategy("nope", error_cls=MyErr)
-
-
-def test_iter_hits_convenience_builds_strategy() -> None:
     es = MagicMock()
-    es.search.return_value = {"_scroll_id": "s", "hits": {"hits": [_hit({"id": 1})]}}
-    es.scroll.return_value = {"_scroll_id": "s", "hits": {"hits": []}}
-    out = list(iter_hits(es, "i", {}, strategy="scroll", page_size=5))
+    es.open_point_in_time.return_value = {"id": "pit-1"}
+    es.search.side_effect = RuntimeError("down")
+    with pytest.raises(MyErr):
+        list(
+            SearchAfterPagination(error_cls=MyErr).iter_hits(
+                es=es, index="i", query={}, page_size=2
+            )
+        )
+    es.close_point_in_time.assert_called_once_with(body={"id": "pit-1"})
+
+
+# --- one-call iter_hits convenience --------------------------------------
+
+def test_iter_hits_convenience_streams_via_pit() -> None:
+    es = MagicMock()
+    es.open_point_in_time.return_value = {"id": "pit-1"}
+    es.search.side_effect = [
+        {"pit_id": "pit-1", "hits": {"hits": [_hit({"id": 1}, [1])]}},
+        {"pit_id": "pit-1", "hits": {"hits": []}},
+    ]
+    out = list(iter_hits(es, "i", {}, page_size=5))
     assert out == [{"id": 1}]
+    es.open_point_in_time.assert_called_once_with(index="i", keep_alive="5m")
 
 
 # --- diagnostics ---------------------------------------------------------

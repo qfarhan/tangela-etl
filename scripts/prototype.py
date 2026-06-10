@@ -139,7 +139,6 @@ def run_live(args: argparse.Namespace, out: Path) -> int:
 
     from etl.extractor import expected_count, iter_hits
     from etl.job_loader import load_job
-    from etl.pagination.base import make_strategy
 
     es = Elasticsearch(args.es_url)
     try:
@@ -158,9 +157,8 @@ def run_live(args: argparse.Namespace, out: Path) -> int:
     expected = expected_count(es, job.data_index, job.query)
     print(f"  _count       : {expected}")
 
-    strategy = make_strategy(args.strategy, keep_alive=args.keep_alive)
-    hits = list(iter_hits(es, job, strategy, page_size=args.page_size))
-    print(f"  fetched      : {len(hits)} hits via '{args.strategy}'")
+    hits = list(iter_hits(es, job, page_size=args.page_size, keep_alive=args.keep_alive))
+    print(f"  fetched      : {len(hits)} hits via PIT + search_after")
 
     result = transform_to_csv(hits, job.columns, job.column_paths, out, job_id=job.job_id)
     return _report(result, expected=expected)
@@ -175,8 +173,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--es-url", default="http://localhost:9200")
     parser.add_argument("--job-index", default="etl-jobs")
     parser.add_argument("--job-doc-id", default="daily-sales-export")
-    parser.add_argument("--strategy", default="scroll",
-                        choices=["scroll", "search_after"])
     parser.add_argument("--page-size", type=int, default=100)
     parser.add_argument("--keep-alive", default="1m")
     parser.add_argument("--verbose", action="store_true",

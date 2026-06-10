@@ -1,8 +1,8 @@
 """Top-level extraction helpers: ``count`` and a one-call ``iter_hits``.
 
 ``iter_hits`` is the convenience entry point for callers who just want "stream
-every hit this query matches" without wiring a strategy by hand. Pass a
-strategy *name* (it builds one) or a ready-made ``PaginationStrategy``.
+every hit this query matches" without constructing a strategy by hand. It
+paginates with point-in-time + ``search_after`` (see :mod:`es_extract.pagination`).
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from es_extract.errors import EsExtractError
-from es_extract.pagination import PaginationStrategy, make_strategy
+from es_extract.pagination import SearchAfterPagination
 
 
 def count(
@@ -28,21 +28,17 @@ def count(
 
 def iter_hits(
     es: Any, index: str, query: dict[str, Any], *,
-    strategy: str | PaginationStrategy = "scroll",
     page_size: int = 1000, keep_alive: str = "5m", source_only: bool = True,
     error_cls: type[Exception] = EsExtractError,
 ) -> Iterator[dict[str, Any]]:
-    """Stream every hit ``query`` matches, paginating with ``strategy``.
+    """Stream every hit ``query`` matches via point-in-time + ``search_after``.
 
-    ``strategy`` may be a name (``"scroll"`` / ``"search_after"``) — in which
-    case ``keep_alive`` / ``source_only`` / ``error_cls`` configure the strategy
-    that gets built — or an already-constructed ``PaginationStrategy``.
+    ``keep_alive`` / ``source_only`` / ``error_cls`` configure the underlying
+    :class:`~es_extract.pagination.SearchAfterPagination`. Pass
+    ``source_only=False`` to receive the full hit envelope (``_id``, ``_score``,
+    ``sort``) instead of just ``_source``.
     """
-    strat = (
-        strategy
-        if not isinstance(strategy, str)
-        else make_strategy(
-            strategy, keep_alive=keep_alive, source_only=source_only, error_cls=error_cls
-        )
+    strategy = SearchAfterPagination(
+        keep_alive=keep_alive, source_only=source_only, error_cls=error_cls
     )
-    return strat.iter_hits(es=es, index=index, query=query, page_size=page_size)
+    return strategy.iter_hits(es=es, index=index, query=query, page_size=page_size)
