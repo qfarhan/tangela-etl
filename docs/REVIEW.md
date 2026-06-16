@@ -5,6 +5,15 @@
 actually ships, and record the code-level blind spots they surface. It is a companion to — and a
 punch-list for — `DESIGN.md` (the theory) and `TUTORIAL.md` (the build log).
 
+> **⚠️ Superseded in part by the PIT-only refactor (2026-06).** After this review, the **Scroll
+> pagination strategy was removed entirely** and the `src/etl/pagination/` package was deleted:
+> extraction is now **point-in-time + `search_after` only**, living in the standalone `es_extract`
+> package with `etl/extractor.py` as the single thin wrapper. `DESIGN.md` and `TUTORIAL.md` were
+> rewritten to match (Scroll now appears only as a one-line "legacy NiFi mechanism we chose against").
+> The **Scroll-specific findings below are therefore moot** — T1, T2, and the `scroll.py` references in
+> the verified-facts list and §3.1/T5. Post-refactor state: **72 tests, `ruff` + `mypy --strict`
+> clean, ~88% coverage.**
+
 **Method.** Every source module under `src/etl/` was read, both docs were read end-to-end, and the
 claims were checked against a live run of the suite. Where a finding is empirical, the evidence is
 shown inline. Priority, per the review brief, is **TUTORIAL.md correctness and whether it covers all
@@ -14,8 +23,8 @@ of the code** — that is Part 1.
 
 > **Update:** many of the findings below have since been applied — see the **Resolution status**
 > section right after the legend. The figures in this section are *as found at review time*; the
-> post-fix state is **82 tests / ~88% coverage** (includes the `es_extract` follow-on — see the
-> Resolution status section).
+> post-fix state is **72 tests / ~88% coverage** (after the later PIT-only refactor — it was 82
+> before Scroll's tests were removed; see the Resolution status section).
 
 - `pytest` collected **64 tests** at review time; they passed with **83%** line coverage
   (`pytest --cov=etl`). *(Now **67 / ~86%** after the two added test files.)*
@@ -73,7 +82,7 @@ took it to **82 tests, `ruff` + `mypy --strict` clean, ~88% coverage**.
 
 | Change | Detail |
 |---|---|
-| Standalone `es_extract` package | The ES extraction layer (pagination strategies, `count`, one-call `iter_hits`) moved into `src/es_extract/` — deps: `elasticsearch` + stdlib only, **zero** `etl` imports — so it is reusable in other projects. `etl/pagination/*` and `etl/extractor.py` are now thin wrappers that inject `ElasticsearchQueryError` via an `error_cls` parameter, preserving every existing test contract and the `EtlError` boundary. Documented in DESIGN §20 + appendix and README. **TUTORIAL.md intentionally untouched.** |
+| Standalone `es_extract` package (later made PIT-only) | The ES extraction layer (`count`, one-call `iter_hits`, the pagination generator) moved into `src/es_extract/` — deps: `elasticsearch` + stdlib only, **zero** `etl` imports — so it is reusable in other projects. A subsequent refactor **removed Scroll** and deleted `etl/pagination/`; `etl/extractor.py` is now the single thin wrapper injecting `ElasticsearchQueryError` via an `error_cls` parameter, preserving the `EtlError` boundary. Documented in DESIGN §16–20 + appendix, README, and (this time) **TUTORIAL.md ETL-C1**, which was rewritten PIT-only. A standalone harness, `scripts/try_es_extract.py`, exercises the package against a real ES. |
 | Streaming NDJSON diagnostic | `es_extract.diagnostics.tee_to_ndjson` captures the raw hit stream to disk without buffering. Wired into the pipeline opt-in via the new `ES_RAW_DUMP_DIR` env var (unset = disabled): each job dumps `<dir>/<job_id>.ndjson`. New tests cover the package (`tests/test_es_extract.py`) and the pipeline wiring. |
 | Note on §3.1 (`_id`) | The new `es_extract` strategies accept `source_only=False` to yield the **full hit envelope** (incl. `_id`). The `_id` capability gap now has a clean, opt-in path at the reusable layer if a future job needs it — though `etl`'s wrappers still default to `_source` (unchanged behavior). |
 

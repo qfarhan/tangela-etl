@@ -2,7 +2,14 @@
   "permissions": {
     "allow": [
       "Bash(python3 -c \"import sys; sys.path.insert\\(0,'src'\\); import etl; print\\('etl', etl.__version__\\)\")",
-      "Bash(.venv/bin/python -)"
+      "Bash(.venv/bin/python -)",
+      "Bash(.venv/bin/ruff check *)",
+      "Bash(.venv/bin/python -m pytest -q)",
+      "Bash(.venv/bin/python -m pytest -q --cov=etl --cov=es_extract --cov-report=term-missing)",
+      "Bash(.venv/bin/mypy src *)",
+      "Bash(rm -f local/sftp/upload/*)",
+      "Bash(rm -rf /tmp/etl-csv-local)",
+      "Bash(docker exec *)"
     ]
   }
 }

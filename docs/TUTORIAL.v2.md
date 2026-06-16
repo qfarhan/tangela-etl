@@ -1,9 +1,27 @@
-# Build-It-Yourself Tutorial
+# Build-It-Yourself Tutorial — v2
 
 **Goal:** build the `kafka-es-csv-sftp-etl` service from an empty folder to a working daemon,
 *one testable module at a time*. By the end you will have written every script yourself and you
 will understand (a) what each function does, (b) the advanced Python techniques it uses, and
 (c) the Kafka/Elasticsearch concepts behind every parameter.
+
+> **📌 What's new in v2.** This revision folds in the still-applicable findings from
+> [`docs/REVIEW.md`](REVIEW.md) on top of the PIT-only codebase (Scroll pagination has been removed;
+> extraction is point-in-time + `search_after` only, packaged in standalone `es_extract`). The
+> Scroll-specific review findings (T1, T2, T3's `_keep_alive` mismatch) are **moot** — they were
+> resolved by the refactor itself. The findings carried in here are the ones that were *deferred* or
+> are *documentation-only*:
+> - **T5 / §3.1** — the document `_id` is not reachable by column projection (the envelope is gone by
+>   the transformer stage). Now called out at **ETL-B1**, with the `source_only=False` opt-in noted.
+> - **§3.4 / §3.5** — `_HashingWriter.write` return value and nested-value stringification. Noted at
+>   **ETL-B2**.
+> - **§3.3 / C1** — SFTP delivery is not atomic at the destination; the sidecar-ordering "ready"
+>   signal is the implicit contract. Noted at **ETL-D2**.
+> - **N1** — the ETL-E3 `main()` snippet now includes the `"starting etl daemon"` log line its DoD
+>   checks for.
+> - **N2** — each ticket now carries a **📐 See DESIGN §N** cross-link.
+>
+> Verified post-refactor state: **72 tests, `ruff` + `mypy --strict` clean, ~88% coverage.**
 
 **Who this is for:** a developer comfortable with Python who wants to level up on
 *application* development — generators, protocols, dependency injection, decorators, structured
@@ -55,6 +73,8 @@ These five tickets give you a buildable, testable, type-checked skeleton plus th
 primitives (errors, config, logging, retry) that *every* later module depends on. No Kafka or ES yet.
 
 ## 🎫 ETL-A1 — Project scaffolding & tooling  *(est. 0.5 d)*
+
+📐 **See DESIGN:** §5 (project layout & packaging).
 
 🎯 **Goal:** an installable package with linting, typing, and testing wired up, so that from now on
 every ticket can end with a green `pytest`.
@@ -129,6 +149,8 @@ without configuration errors. You now have a green harness to build into.
 ---
 
 ## 🎫 ETL-A2 — The vocabulary: errors & models  *(est. 0.5 d)*
+
+📐 **See DESIGN:** §7 (the error hierarchy & single catch boundary).
 
 🎯 **Goal:** define the typed data and the exception hierarchy the whole pipeline speaks in. Pure
 Python, no dependencies — the perfect first real code.
@@ -254,6 +276,8 @@ classes import cleanly; mypy clean.
 ---
 
 ## 🎫 ETL-A3 — Configuration  *(est. 0.5–1 d)*
+
+📐 **See DESIGN:** §6 (fail-fast, env-driven, immutable config).
 
 🎯 **Goal:** read all settings from the environment once, validate them, and freeze them. A process
 that starts has known-good config.
@@ -401,6 +425,8 @@ and "bad integer" cases; `mypy` clean. Settings load and validate.
 
 ## 🎫 ETL-A4 — Structured logging  *(est. 0.5 d)*
 
+📐 **See DESIGN:** §8 (structured JSON for machines and humans).
+
 🎯 **Goal:** emit one JSON object per log line so logs are both human-readable and machine-queryable,
 with per-job context attached.
 
@@ -481,6 +507,8 @@ def test_extra_fields_become_json(capsys):
 ---
 
 ## 🎫 ETL-A5 — The retry primitive  *(est. 1 d)*
+
+📐 **See DESIGN:** §9 (backoff, jitter, and an injectable clock).
 
 🎯 **Goal:** one reusable exponential-backoff-with-jitter helper that Kafka/ES/SFTP all build on,
 *with an injectable clock so tests spend zero real time*. This is the richest "advanced Python"
@@ -606,6 +634,8 @@ Everything here is pure and offline — you can demo real value before touching 
 
 ## 🎫 ETL-B1 — The transformer (dotted-path projection)  *(est. 1 d)*
 
+📐 **See DESIGN:** §21–22 (the projection problem & dotted-path projection).
+
 🎯 **Goal:** flatten each Elasticsearch document into a row of named columns using a small path
 language (`a.b[0].c`), with missing paths becoming empty strings.
 
@@ -680,6 +710,17 @@ def iter_transformed(hits: Iterable[dict[str, Any]], column_paths: dict[str, str
   (someone mis-wrote the job doc); missing *data* does not. Knowing *which* failures to surface vs.
   tolerate is a design skill.
 
+> ⚠️ **The `_id` caveat (REVIEW §3.1 / T5).** By the time `iter_transformed` runs, pagination has
+> already reduced each hit to its **`_source`** dict — the envelope (`_id`, `_score`, `sort`) is
+> *gone*. So `hit.get("_id")` here is `None` in production, and a column whose path is `"_id"` resolves
+> to `""` (an empty cell), silently. Column paths resolve against `_source` only. If a job genuinely
+> needs the document id as a column, the reusable extractor exposes the opt-in seam for it:
+> `es_extract.iter_hits(..., source_only=False)` yields the **full hit envelope** (incl. `_id`) instead
+> of just `_source` — at which point `"_id"` becomes a usable path. `etl`'s wrapper keeps the
+> `_source`-only default (unchanged behavior), so this is a deliberate, opt-in capability, not the norm.
+> The fixture below carries a literal `"_id"` key purely so the unit test can exercise `hit_id`
+> threading; that key is *not* present in real `_source` data.
+
 🧪 **Tests — `tests/test_transformer.py`:**
 
 ```python
@@ -712,6 +753,8 @@ parametrized missing-path cases.
 ---
 
 ## 🎫 ETL-B2 — CSV writer + integrity sidecar  *(est. 0.5–1 d)*
+
+📐 **See DESIGN:** §23 (streaming CSV and the integrity sidecar).
 
 🎯 **Goal:** stream rows to a CSV file and compute a SHA256 checksum *in the same pass*, writing a
 `sha256sum`-format sidecar.
@@ -786,6 +829,16 @@ def _stringify(v: Any) -> str:
 - **`extrasaction="ignore"`** drops dict keys not in `fieldnames` instead of raising — robust to
   rows carrying extra fields.
 
+> 📎 **Two behaviors worth knowing (REVIEW §3.4 / §3.5).**
+> - **`_stringify` of a nested value is a Python `repr`, not JSON.** If a `column_paths` entry resolves
+>   to a dict or list, the cell becomes `str(value)` → `{'a': 1}` (single quotes), not `{"a": 1}`. This
+>   is fine for the documented *flat*-export use case but surprising if you point a column at an object
+>   or array. If you need JSON cells, `json.dumps` the non-scalars inside `_stringify`.
+> - **`_HashingWriter.write` returns `len(s)` (characters), not `len(b)` (the bytes actually
+>   written).** `csv.DictWriter` ignores the return value, so it's harmless today — but it violates the
+>   `io`-style `write` contract and would mislead any future caller that trusts the count. Return
+>   `len(b)` if you ever reuse the wrapper elsewhere.
+
 🧪 **Tests — `tests/test_csv_writer.py`:**
 
 ```python
@@ -818,6 +871,8 @@ Now connect to the data plane: page through a query efficiently and turn a job d
 `JobSpec`.
 
 ## 🎫 ETL-C1 — PIT + `search_after` pagination + extractor  *(est. 1–1.5 d)*
+
+📐 **See DESIGN:** §16–20 (deep-pagination theory → the stable cursor → `es_extract` → the extractor seam).
 
 🎯 **Goal:** stream every hit of a query out of Elasticsearch without loading it all into memory or
 hitting deep-pagination limits — using point-in-time + `search_after`, packaged as a standalone,
@@ -999,6 +1054,8 @@ test; `es_extract` imports nothing from `etl`; mypy clean.
 
 ## 🎫 ETL-C2 — Job loader (validate at the boundary)  *(est. 0.5 d)*
 
+📐 **See DESIGN:** §14–15 (the job-document pattern & validation at the boundary).
+
 🎯 **Goal:** fetch a job document by id and validate every field into a trustworthy `JobSpec`.
 
 📄 **`src/etl/job_loader.py`:**
@@ -1095,6 +1152,8 @@ works. Extraction is *complete and testable*.
 # PHASE D — Trust & delivery (Epic: ETL-D)
 
 ## 🎫 ETL-D1 — The validator (two-tier count check)  *(est. 1–1.5 d)*
+
+📐 **See DESIGN:** §24 (why counts disagree, and the two-tier strategy).
 
 🎯 **Goal:** guarantee the CSV row count equals what ES says — tolerating transient races, but failing
 loudly on real loss.
@@ -1216,6 +1275,8 @@ mypy clean.
 
 ## 🎫 ETL-D2 — SFTP uploader  *(est. 1 d)*
 
+📐 **See DESIGN:** §25 (subprocess over library, and the security posture).
+
 🎯 **Goal:** deliver the CSV + sidecar over SFTP securely, with retry — by shelling out to the system
 `sftp` binary (no paramiko), enforcing strict host-key checking.
 
@@ -1297,6 +1358,16 @@ upload your data to *whoever answers* — the most common SFTP security mistake.
 operator-supplied `UserKnownHostsFile`, use `BatchMode=yes` (never prompt — fail fast instead of
 hanging), and key-based auth (`-i`).
 
+> ⚠️ **Delivery is not atomic at the destination (REVIEW §3.3 / C1).** `_build_batch` emits
+> `put <local> <final-remote>` straight to the final name — there is no upload-to-temp-then-`rename`.
+> So a partner *polling the drop directory* can observe a **half-written CSV**. The implicit safety
+> valve is **ordering**: the data file is `put` before its `.sha256`, so a consumer that waits for the
+> sidecar to appear before reading the CSV is safe — treat *"sidecar present = file ready"* as the
+> delivery contract. Two ways to harden it if a partner can't honor that contract: (a) `put` to
+> `<remote>.tmp` then `rename` to the final name (atomic on POSIX servers), or (b) document the
+> wait-for-sidecar rule explicitly in the partner runbook. Left as a ticket here — it's a behavior
+> change — but it should not be invisible.
+
 🧪 **Tests — `tests/test_sftp_uploader.py`** (monkeypatch the subprocess; never open a socket):
 
 ```python
@@ -1336,6 +1407,8 @@ and fully unit-tested offline.
 # PHASE E — Control plane & wiring (Epic: ETL-E)
 
 ## 🎫 ETL-E1 — Kafka control consumer  *(est. 1 d)*
+
+📐 **See DESIGN:** §10–12 (why Kafka triggers but doesn't carry · delivery semantics · `ControlConsumer`).
 
 🎯 **Goal:** consume the control topic, decode each message into a `ControlMessage`, and hand the
 caller a manual-commit callback — with poison/null handling.
@@ -1478,6 +1551,8 @@ hence the `or 0`/None handling).
 
 ## 🎫 ETL-E2 — Pipeline orchestration  *(est. 0.5–1 d)*
 
+📐 **See DESIGN:** §26 (the orchestrator, `run_one`).
+
 🎯 **Goal:** compose all stages into `run_one`, the function that processes a single control message
 (without committing — that's the daemon's call).
 
@@ -1539,6 +1614,8 @@ a CSV and triggers a (faked) SFTP upload, with no real infrastructure.
 
 ## 🎫 ETL-E3 — Daemon entry point  *(est. 1 d)*
 
+📐 **See DESIGN:** §13 (the daemon loop & process lifecycle) and §27 (a full trace of one message).
+
 🎯 **Goal:** the long-lived process: poll, run a job, commit on success, **halt on failure**, shut down
 gracefully on signals.
 
@@ -1551,6 +1628,7 @@ def main() -> int:
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr); return 2
     configure_logging(settings.log_level)
+    _log.info("starting etl daemon", extra={"control_topic": settings.kafka.control_topic})
 
     stopping = {"flag": False}
     def _on_signal(signum, _frame): stopping["flag"] = True
@@ -1603,6 +1681,8 @@ control message into a delivered file.
 # PHASE F — Local stack & smoke test (Epic: ETL-F)
 
 ## 🎫 ETL-F1 — docker-compose + scripts + seed  *(est. 1–1.5 d)*
+
+📐 **See DESIGN:** §29 (the local mock environment).
 
 🎯 **Goal:** a one-command local environment (Kafka + ES + SFTP) and a seed script, so you can run the
 real daemon against disposable infrastructure and execute the failure-mode drills.

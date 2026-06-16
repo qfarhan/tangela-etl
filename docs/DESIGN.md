@@ -35,9 +35,9 @@ a production service. Every section explains **why** a design choice was made be
 14. Data-driven jobs: the job document pattern
 15. The job loader: validation at the boundary
 16. Deep pagination theory: why `from`/`size` breaks
-17. The Strategy pattern and the factory
-18. Scroll pagination (NiFi parity)
-19. `search_after` + Point-In-Time pagination
+17. Point-in-time + `search_after`: a stable cursor
+18. The pagination generator: streaming + lifecycle
+19. `es_extract`: a standalone, reusable extraction package
 20. The extractor: a thin, honest seam
 
 **Part V — Transformation & output**
@@ -150,7 +150,7 @@ sequentially. The flow for one message:
  Extractor.expected_count (ES _count) ──► N   (how many docs the query matches, recorded up front)
         │
         ▼
- PaginationStrategy.iter_hits (Scroll or search_after) ──► stream of _source dicts
+ SearchAfterPagination.iter_hits (PIT + search_after) ──► stream of _source dicts
         │
         ▼
  Transformer.iter_transformed (dotted-path projection) ──► stream of flat {column: value} dicts
@@ -234,10 +234,6 @@ python-kafka/
 │       ├── control_consumer.py
 │       ├── job_loader.py
 │       ├── extractor.py
-│       ├── pagination/
-│       │   ├── base.py
-│       │   ├── scroll.py
-│       │   └── search_after.py
 │       ├── transformer.py
 │       ├── csv_writer.py
 │       ├── validator.py
@@ -304,7 +300,7 @@ It does three things, in order:
    `override=False` means real environment variables always win over the file.
 2. Reads each value through small typed helpers — `_get` (string, with a `required=True` option),
    `_get_int`, `_get_float` — that raise `ConfigError` on a missing-required or malformed value.
-3. Validates cross-field rules (e.g., `PAGINATION_STRATEGY` must be `scroll` or `search_after`) and
+3. Coerces and range-checks values (e.g., `PAGE_SIZE` must parse as an integer) and
    constructs the frozen dataclasses.
 
 The helper pattern is worth internalizing:
@@ -350,7 +346,7 @@ EtlError                       # base: every recoverable, job-scoped failure
 ├── ConfigError                # startup misconfiguration
 ├── ControlMessageError        # undecodable / malformed Kafka message
 ├── JobSpecError               # the ES job document is missing/malformed
-├── ElasticsearchQueryError    # any ES request failure (count, search, scroll, PIT)
+├── ElasticsearchQueryError    # any ES request failure (count, search, PIT)
 ├── TransformError             # projecting a hit failed (carries job_id, hit_id)
 ├── CsvWriteError              # local CSV/sidecar write failed
 ├── RecordCountMismatch        # validation failed (carries expected, actual, attempts[])
@@ -688,121 +684,65 @@ reasons:
    double-count rows. For an export that must match a count exactly, that is fatal.
 
 The fix for both is to paginate over a **consistent point-in-time view** using a **stable cursor**
-rather than a numeric offset. Two mechanisms do this:
+rather than a numeric offset. Two cursor mechanisms exist.
 
-**Scroll API.** You open a *scroll context* with an initial search; ES freezes a view of the data and
-returns a `_scroll_id`. You repeatedly call `scroll` with that ID to get the next page until pages
-run dry, then `clear_scroll` to release the resources. Scroll is the classic, battle-tested
-mechanism and is what the existing NiFi flow uses. Its downsides: the scroll context holds search
-resources on the cluster for its TTL, and it is stateful server-side, which makes it less friendly to
-load-balanced or long-lived use.
+**Scroll API.** The classic one: you open a server-side *scroll context*, get a `_scroll_id`, and call
+`scroll` repeatedly until the pages run dry, then `clear_scroll`. It is what the original NiFi flow
+used. Its downside is that the scroll context holds search resources on the cluster for its whole TTL
+and is *stateful server-side*, which makes it awkward for load-balanced or long-lived use. Elastic now
+recommends against it for new code.
 
-**Point-In-Time (PIT) + `search_after`.** The modern replacement. You open a **PIT** — a lightweight,
-named consistent view — then issue *stateless* searches that sort by a stable key and use
-`search_after` to say "give me what comes after this sort value." Each request is independent
-(easier to balance and reason about), and sorting on `_shard_doc` (a cheap, stable, per-shard
-tie-breaker available only inside a PIT) makes the cursor both stable and efficient. You close the
-PIT when done. Elastic recommends PIT + `search_after` over Scroll for new code.
+**Point-In-Time (PIT) + `search_after`.** The modern replacement, and the one this project uses. You
+open a **PIT** — a lightweight, named consistent view — then issue *stateless* searches that sort by a
+stable key and use `search_after` to say "give me what comes after this sort value." Each request is
+independent (easy to balance and reason about), and sorting on `_shard_doc` (a cheap, stable,
+per-shard tie-breaker available only inside a PIT) makes the cursor both stable and efficient. You
+close the PIT when done.
 
-**The decision in this project:** support *both*, defaulting to **Scroll** for parity with the NiFi
-flow being replaced (lowest-risk migration), while offering **`search_after`** as the recommended
-path for new jobs. Which one runs is a single config value. That requirement — "swap the algorithm
-without touching the caller" — is exactly what the Strategy pattern exists for.
+**The decision in this project:** use PIT + `search_after` exclusively. An earlier iteration kept a
+pluggable Scroll strategy for one-to-one NiFi parity, but carrying two code paths — and the
+Strategy-pattern factory to switch between them — earned its keep only while Scroll was a live option.
+With PIT the recommended mechanism and no requirement to mimic Scroll's exact semantics, we collapsed
+to the single strategy the next three sections describe.
 
-## 17. The Strategy pattern and the factory
+## 17. Point-in-time + `search_after`: a stable cursor
 
-**The pattern.** The **Strategy pattern** captures a family of interchangeable algorithms behind a
-common interface, so the algorithm can vary independently of the code that uses it. Here the family
-is "ways to page through an ES query," and the common interface is "yield me the hits."
+The whole mechanism rests on one idea: **page with a stable cursor over a frozen view**, never with a
+numeric offset. Three pieces make that work.
 
-`pagination/base.py` defines the interface as a `typing.Protocol`:
+**The point-in-time (PIT).** `open_point_in_time(index, keep_alive)` returns a PIT id naming a
+consistent snapshot of the index. Every search that passes that id sees the same set of documents,
+even if writes land while you page — which is exactly the property §16 said an exact-count export
+needs. `keep_alive` (e.g. `"5m"`) is how long ES retains the snapshot between requests; each request
+renews it.
 
-```python
-class PaginationStrategy(Protocol):
-    def iter_hits(self, *, es: Any, index: str, query: dict[str, Any],
-                  page_size: int) -> Iterator[dict[str, Any]]: ...
-```
+**The sort key.** Inside a PIT you may sort on `_shard_doc` — a synthetic, monotonic, per-shard
+tie-breaker that is both cheap and *total* (no ties). A total order is what makes a cursor
+unambiguous: there is always a well-defined "next" document.
 
-**Why a `Protocol` and not an abstract base class?** A `Protocol` is *structural* typing: any class
-with a matching `iter_hits` method satisfies it, with no explicit inheritance required. The two
-strategies do not have to import or subclass anything — they just have the right shape. This keeps
-them decoupled and is the Pythonic expression of "program to an interface."
+**The cursor.** Each response's last hit carries a `sort` array (its `_shard_doc` value). Feed that
+back as the next request's `search_after`, and ES returns "everything after that point." Repeat until
+a page comes back empty. The cursor is a *value in the data*, not a position in a result set, so it
+cannot drift the way `from`/`size` does.
 
-A small **factory** turns a config string into an instance:
+We also set `track_total_hits: False`: the validator computes the authoritative count separately via
+`_count` (§24), so paying for an exact total on every page would be wasted work.
 
-```python
-def make_strategy(name: str, *, keep_alive: str) -> PaginationStrategy:
-    if name == "scroll":         return ScrollPagination(keep_alive=keep_alive)
-    if name == "search_after":   return SearchAfterPagination(keep_alive=keep_alive)
-    raise ConfigError(...)
-```
+## 18. The pagination generator: streaming + lifecycle
 
-The factory localizes the only place that knows the *set* of strategies, and the imports are local to
-each branch (lazy, avoiding import cycles with the package). The caller (`pipeline`) just says
-`make_strategy(settings.pagination.strategy, keep_alive=...)` and receives something it can call
-`iter_hits` on — it neither knows nor cares which algorithm it got. Adding a third strategy later is a
-new file plus one branch here; nothing else changes. That is the Open/Closed principle in practice:
-open to extension, closed to modification.
-
-## 18. Scroll pagination (NiFi parity)
-
-`pagination/scroll.py` implements the Scroll algorithm as a **generator**:
-
-```python
-@dataclass
-class ScrollPagination:
-    keep_alive: str = "5m"
-    def iter_hits(self, *, es, index, query, page_size) -> Iterator[dict]:
-        scroll_id = None
-        try:
-            resp = es.search(index=index, scroll=self.keep_alive, size=page_size,
-                             body={"query": query})
-            scroll_id = resp.get("_scroll_id")
-            hits = resp["hits"]["hits"]
-            while hits:
-                for h in hits:
-                    yield h.get("_source", {})
-                resp = es.scroll(scroll_id=scroll_id, scroll=self.keep_alive)
-                scroll_id = resp.get("_scroll_id")
-                hits = resp["hits"]["hits"]
-        finally:
-            if scroll_id is not None:
-                try: es.clear_scroll(scroll_id=scroll_id)
-                except Exception as e: _log.warning("clear_scroll failed: %r", e)
-```
-
-Three design points, each a transferable lesson:
-
-1. **Generators give us streaming for free.** `iter_hits` `yield`s one `_source` at a time. The
-   caller pulls hits lazily; we never materialize the whole result set. The page size bounds memory.
-   The same code handles five rows or five million.
-
-2. **Resource lifecycle lives in `finally`.** A scroll context is a server-side resource that *must*
-   be released. The `try/finally` guarantees `clear_scroll` runs **even if the consumer abandons
-   iteration partway** — for example, if a downstream stage raises and the generator is closed early.
-   This is the critical correctness property of a resource-owning generator: the cleanup is bound to
-   the generator's lifetime, not to "reaching the last line." Forgetting this leaks scroll contexts
-   until their TTL reaps them, degrading the cluster.
-
-3. **Cleanup failures are swallowed (logged, not raised).** If `clear_scroll` itself fails, we log
-   and move on. Why? Because the scroll's TTL will reap it anyway, and raising from cleanup would
-   *mask the original exception* that triggered the cleanup. Cleanup should never overwrite the real
-   error.
-
-Errors from the ES calls are wrapped in `ElasticsearchQueryError`, keeping the "all ES failures look
-the same to the daemon" contract from §7.
-
-## 19. `search_after` + Point-In-Time pagination
-
-`pagination/search_after.py` implements the modern strategy, also as a generator with the same
-shape — that sameness is the whole point of the Strategy pattern:
+`es_extract/pagination.py` implements the strategy as a single **generator**, `SearchAfterPagination`:
 
 ```python
 @dataclass
 class SearchAfterPagination:
     keep_alive: str = "5m"
+    source_only: bool = True
+    error_cls: type[Exception] = EsExtractError
     def iter_hits(self, *, es, index, query, page_size) -> Iterator[dict]:
-        pit = es.open_point_in_time(index=index, keep_alive=self.keep_alive)
+        try:
+            pit = es.open_point_in_time(index=index, keep_alive=self.keep_alive)
+        except Exception as e:
+            raise self.error_cls(f"open_point_in_time failed: {e!r}") from e
         pit_id = pit.get("id")
         try:
             search_after = None
@@ -817,7 +757,7 @@ class SearchAfterPagination:
                 hits = resp["hits"]["hits"]
                 if not hits: break
                 for h in hits:
-                    yield h.get("_source", {})
+                    yield h.get("_source", {})        # whole hit if source_only=False
                 search_after = hits[-1].get("sort")   # cursor = last row's sort values
                 if not search_after: break
         finally:
@@ -826,15 +766,61 @@ class SearchAfterPagination:
                 except Exception as e: _log.warning("close_point_in_time failed: %r", e)
 ```
 
-The same lifecycle discipline applies (open PIT → page → **close PIT in `finally`**). The
-algorithm-specific details: sorting on `_shard_doc` (the cheapest stable tie-breaker, valid only
-within a PIT); `track_total_hits: False` to skip the expensive exact-count computation we do not need
-here; and the **cursor** being the previous page's last hit's `sort` array, fed back as
-`search_after`. When a page comes back empty (or without a sort), we are done.
+Three design points, each a transferable lesson:
 
-Notice that from the *caller's* perspective, `ScrollPagination` and `SearchAfterPagination` are
-indistinguishable: both are objects with `iter_hits(...)` that stream `_source` dicts and clean up
-after themselves. All the difference is encapsulated. That is the dividend of the pattern.
+1. **Generators give us streaming for free.** `iter_hits` `yield`s one `_source` at a time. The
+   caller pulls hits lazily; we never materialize the whole result set. The page size bounds memory.
+   The same code handles five rows or five million.
+
+2. **Resource lifecycle lives in `finally`.** A PIT is a server-side resource that *must* be released.
+   The `try/finally` guarantees `close_point_in_time` runs **even if the consumer abandons iteration
+   partway** — for example, if a downstream stage raises and the generator is closed early. This is
+   the critical correctness property of a resource-owning generator: the cleanup is bound to the
+   generator's lifetime, not to "reaching the last line." Forgetting it leaks PITs until their
+   keep-alive reaps them, holding search resources on the cluster.
+
+3. **Cleanup failures are swallowed (logged, not raised).** If `close_point_in_time` itself fails, we
+   log and move on. Why? Because the keep-alive will reap the PIT anyway, and raising from cleanup
+   would *mask the original exception* that triggered the cleanup. Cleanup should never overwrite the
+   real error.
+
+Errors from the ES calls are wrapped in `error_cls` — `EsExtractError` by default, or whatever the
+host injects (the `etl` daemon injects `ElasticsearchQueryError`, keeping the "all ES failures look
+the same to the daemon" contract from §7).
+
+## 19. `es_extract`: a standalone, reusable extraction package
+
+The pagination generator, the `_count` helper, and a streaming diagnostic do not live under `etl` at
+all — they live in `src/es_extract/`, a package that depends on **only** the `elasticsearch` client
+and the standard library, with no import of anything application-specific. You can copy the directory
+out, or `pip install` this repo, and use it anywhere:
+
+```python
+from elasticsearch import Elasticsearch
+from es_extract import count, iter_hits
+
+es = Elasticsearch("http://localhost:9200")
+print(count(es, "my-index", {"match_all": {}}))
+for src in iter_hits(es, "my-index", {"match_all": {}}):   # PIT + search_after, streamed
+    ...
+```
+
+Two seams keep it reusable without forcing one host's choices on every caller:
+
+* **`source_only`.** By default each yielded value is the hit's `_source` dict — the common case. Pass
+  `source_only=False` to receive the whole envelope (`_id`, `_score`, `sort`), for callers that need
+  document ids or relevance.
+* **`error_cls`.** Every ES failure is wrapped in an injectable exception type, defaulting to
+  `EsExtractError`. A host application passes its own — `etl` passes `ElasticsearchQueryError` — so
+  failures land in the host's existing `except` boundary while the package itself stays ignorant of
+  that hierarchy. This is dependency injection applied to *error taxonomy*.
+
+The package also ships `tee_to_ndjson`, a generator that wraps a hit stream and writes each hit to an
+NDJSON file *as it passes through*, without buffering — the pipeline uses it (opt-in, via
+`ES_RAW_DUMP_DIR`) to capture exactly what came out of ES for diagnostics. Because `es_extract` has no
+`etl` dependency, you can exercise it in isolation against a real cluster with
+`scripts/try_es_extract.py` (it can even seed a throwaway index first): it builds a `JobSpec`, runs
+`count` + `iter_hits`, and checks the streamed total against `_count`.
 
 ## 20. The extractor: a thin, honest seam
 
@@ -845,26 +831,23 @@ def expected_count(es, index, query) -> int:
     resp = es.count(index=index, body={"query": query})
     return int(resp.get("count", 0))
 
-def iter_hits(es, job, strategy, *, page_size) -> Iterator[dict]:
-    return strategy.iter_hits(es=es, index=job.data_index, query=job.query, page_size=page_size)
+def iter_hits(es, job, *, page_size, keep_alive="5m") -> Iterator[dict]:
+    return es_extract.iter_hits(es, job.data_index, job.query, page_size=page_size,
+                                keep_alive=keep_alive, error_cls=ElasticsearchQueryError)
 ```
 
 `expected_count` issues the `_count` query — the *ground truth* the validator will check against.
-`iter_hits` is a thin adapter that unpacks a `JobSpec` and hands the pieces to the chosen strategy.
+`iter_hits` is a thin adapter that unpacks a `JobSpec` and hands the pieces to `es_extract`, pinning
+failures to `ElasticsearchQueryError`.
 Keeping this seam thin matters: the extractor is the one place that knows "a job has a count and a
 stream of hits," and it expresses that without entangling itself in *how* the hits are produced.
 
-> **The extraction layer is a standalone package.** The pagination strategies, the `_count`
-> helper, and a streaming NDJSON diagnostic live in `src/es_extract/` — a package that depends only
-> on the `elasticsearch` client and the standard library, with **no** import of anything under
-> `etl`. `etl/pagination/*` and `etl/extractor.py` are thin wrappers that inject `etl`'s own
-> `ElasticsearchQueryError` as the failure type (via an injectable `error_cls`) so failures still
-> land in the daemon's single `EtlError` boundary (§7). This is ports-and-adapters taken one step
-> further: the data-source adapter is independently reusable — `from es_extract import count,
-> iter_hits` works in any project — while the application keeps its own error taxonomy. The same
-> package exposes `tee_to_ndjson`, which the pipeline uses (opt-in, via `ES_RAW_DUMP_DIR`) to dump
-> each job's raw hits to `<dir>/<job_id>.ndjson` *as they stream*, for diagnostics, without
-> buffering the result set.
+> **The extraction layer is a standalone package.** As §19 details, the pagination generator, the
+> `_count` helper, and the NDJSON diagnostic live in `src/es_extract/` with no dependency on `etl`.
+> `extractor.py` is the one wrapper that injects `etl`'s own `ElasticsearchQueryError` (via
+> `error_cls`) so failures still land in the daemon's single `EtlError` boundary (§7). This is
+> ports-and-adapters taken one step further: the data-source adapter is independently reusable, while
+> the application keeps its own error taxonomy.
 
 > **A forward-compatibility note.** These calls pass `body={"query": query}`. In elasticsearch-py
 > 8.x this is *deprecated* (it works but warns) and is *removed* in 9.x — which is exactly why the
@@ -1114,12 +1097,12 @@ Read it as a narrative and you have the whole pipeline in one screen:
    every log line for this job is tagged.
 2. `load_job(...)` → `JobSpec`. Enrich `log_extra` with `job_id` and `data_index`.
 3. `expected_count(...)` → record N up front (and log it).
-4. `make_strategy(settings.pagination.strategy, keep_alive=...)` → the chosen pagination strategy.
+4. The pipeline reads `settings.pagination.pit_keep_alive` for the upcoming PIT + `search_after` pass.
 5. `_do_extract_to_csv(...)` chains the three lazy stages —
    `iter_hits → iter_transformed → write_csv` — into a `CsvResult`.
-6. `validate_with_retry(..., on_full_reextract=_reextract)`. The `_reextract` closure *rebuilds a
-   fresh strategy* (the previous one's scroll/PIT is spent) and re-runs `_do_extract_to_csv`,
-   overwriting the same local path — idempotent by construction.
+6. `validate_with_retry(..., on_full_reextract=_reextract)`. The `_reextract` closure re-runs
+   `_do_extract_to_csv` — a fresh call opens a new point-in-time (the previous one is spent) —
+   overwriting the same local path, idempotent by construction.
 7. `upload(settings.sftp, [UploadPlan(csv), UploadPlan(sidecar)], retry_cfg=...)`.
 
 The function deliberately **does not commit the Kafka offset** — that decision belongs to `__main__`,
@@ -1142,7 +1125,7 @@ Tying every part together, here is the life of a single message, success path:
 3. `__main__` calls `run_one(ctrl, es, settings)`.
 4. `load_job` GETs the `daily-sales-export` document and validates it into a `JobSpec`.
 5. `expected_count` runs `_count` → say **5**.
-6. `make_strategy("scroll", ...)` returns a `ScrollPagination`.
+6. The extractor prepares a PIT + `search_after` pass over `data_index` (the stable-cursor pagination).
 7. `iter_hits` streams 5 `_source` dicts; `iter_transformed` projects each via `column_paths`;
    `write_csv` streams them to `/tmp/etl-csv/daily-sales-2026-05-26.csv`, hashing as it goes, and
    writes the `.sha256` sidecar. `CsvResult.row_count == 5`.
@@ -1184,9 +1167,9 @@ callback). Each seam exists because somewhere a test needed to substitute realit
 produces the right CSV and commits; a count mismatch through all retries plus re-extract raises and
 does **not** commit; an SFTP failure retries five times then raises; a transient SFTP failure that
 recovers on the third attempt commits; a poison message is skipped by committing past it; resources
-(scroll/PIT) are released even when iteration is abandoned. These are the *requirements* expressed as
-executable checks — which is what makes the system safe to change later. The current state: 67 tests
-passing, `ruff` and `mypy --strict` clean, ~86% line coverage.
+(the PIT) is released even when iteration is abandoned. These are the *requirements* expressed as
+executable checks — which is what makes the system safe to change later. The current state: 72 tests
+passing, `ruff` and `mypy --strict` clean, ~88% line coverage.
 
 **Hermeticity is a feature, not an accident.** Recall the `.env` bug from §6: a test that depends on
 the absence of a file on disk is not hermetic. The autouse fixture that neutralizes `load_dotenv`
@@ -1228,7 +1211,7 @@ and it needs nothing running. *Deliverable:* given a list of hit dicts and a col
 verified CSV.
 
 **Stage 1 — read from a real Elasticsearch (a day).**
-Add `errors.py`, `config.py`, `job_loader.py`, the pagination `base` + `scroll`, and `extractor.py`.
+Add `errors.py`, `config.py`, `job_loader.py`, the `es_extract` extraction package, and `extractor.py`.
 Point at a local ES (the compose stack), seed a job document and some data, and run
 extract→transform→CSV end-to-end *without* Kafka or SFTP — just call the functions from a script.
 You now have a working exporter; the trigger is "you ran the script." *Deliverable:* a script that
@@ -1250,9 +1233,11 @@ the work, offsets are committed only on success, and the thing runs as a long-li
 graceful shutdown. This is the MVP of the *product*: a control message in, a delivered file out.
 *Deliverable:* `python -m etl` consuming the control topic end-to-end.
 
-**Stage 5 — choose your pagination (half a day).**
-Add `pagination/search_after.py` and wire it through the factory. New jobs can opt into the modern
-strategy; legacy jobs keep Scroll for NiFi parity. *Deliverable:* a config flag swaps the algorithm.
+**Stage 5 — make extraction reusable and observable (half a day).**
+Factor the ES extraction into the standalone `es_extract` package — PIT + `search_after`, with an
+injectable `error_cls` so the host app keeps its own error taxonomy — and add the streaming NDJSON
+diagnostic (`tee_to_ndjson`, opt-in via `ES_RAW_DUMP_DIR`). *Deliverable:* `from es_extract import
+count, iter_hits` works standalone, and a job can dump its raw hits for troubleshooting.
 
 **Stage 6 — the full product (ongoing, ticketed).**
 These are the enhancements that turn a correct service into an operable one — and they map directly to
@@ -1293,15 +1278,12 @@ document has walked through: the system can be *grown*, because its parts are ge
 | `control_consumer.py` | Kafka control-topic wrapper | ports & adapters, at-least-once, manual commit |
 | `__main__.py` | daemon loop & lifecycle | graceful shutdown, cumulative-commit correctness |
 | `job_loader.py` | ES doc → `JobSpec` | data-driven jobs, validate-at-boundary |
-| `pagination/base.py` | strategy factory + protocol re-export | Strategy pattern, Protocol typing |
-| `pagination/scroll.py` | Scroll pagination (wraps `es_extract`) | resource lifecycle in `finally`, generators |
-| `pagination/search_after.py` | PIT + `search_after` (wraps `es_extract`) | stable-cursor pagination |
-| `extractor.py` | `_count` + delegate to strategy | thin seam over `es_extract` |
+| `extractor.py` | `_count` + PIT/`search_after` hits | thin seam over `es_extract`, injected `error_cls` |
 | `transformer.py` | dotted-path projection | build-the-needed-abstraction, lazy streams |
 | `csv_writer.py` | streaming CSV + SHA256 sidecar | decorator (tee'ing writer), end-to-end integrity |
 | `validator.py` | two-tier count validation | fail-loud, inversion of control (callback) |
 | `sftp_uploader.py` | `sftp -b` upload + retry | subprocess-over-library, strict host-key, no shell injection |
 | `pipeline.py` | orchestrate one job | dependency injection, separation of concerns |
-| `es_extract/pagination.py` | reusable Scroll + PIT/`search_after` | standalone Strategy pattern, injectable `error_cls` |
+| `es_extract/pagination.py` | reusable PIT + `search_after` | resource lifecycle in `finally`, injectable `error_cls` |
 | `es_extract/extract.py` | reusable `count` + `iter_hits` | dependency-light data-source port |
 | `es_extract/diagnostics.py` | streaming NDJSON capture | tee'ing generator, memory-bounded |
